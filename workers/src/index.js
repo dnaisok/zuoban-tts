@@ -6,6 +6,31 @@ let voiceListCache = null;
 let voiceListCacheTime = null;
 const VOICE_CACHE_DURATION =4 *60 * 60 * 1000; // 4小时，单位毫秒
 
+// CORS 配置
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Max-Age': '86400',
+};
+
+// 处理 OPTIONS 预检请求
+function handleOptions(request) {
+  return new Response(null, {
+    status: 204,
+    headers: corsHeaders,
+  });
+}
+
+// 为响应添加 CORS 头部
+function addCorsHeaders(response) {
+  const newResponse = new Response(response.body, response);
+  Object.keys(corsHeaders).forEach(key => {
+    newResponse.headers.set(key, corsHeaders[key]);
+  });
+  return newResponse;
+}
+
 // 定义需要保留的 SSML 标签模式
 const preserveTags = [
   { name: 'break', pattern: /<break\s+[^>]*\/>/g },
@@ -67,6 +92,11 @@ function escapeBasicXml(unsafe) {
 }
 
 async function handleRequest(request) {
+  // 处理 OPTIONS 预检请求
+  if (request.method === 'OPTIONS') {
+    return handleOptions(request);
+  }
+
   const requestUrl = new URL(request.url);
   const path = requestUrl.pathname;
 
@@ -978,7 +1008,9 @@ async function handleRequest(request) {
 }
 
 addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
+  event.respondWith(
+    handleRequest(event.request).then(response => addCorsHeaders(response))
+  );
 });
 
 
