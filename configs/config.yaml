@@ -1,5 +1,8 @@
 server:
   port: 8080
+   cors_allowed_origins:
+    - "https://xue8.site"
+    - "https://video.xue8.site"
   read_timeout: 60
   write_timeout: 60
   base_path: ""
