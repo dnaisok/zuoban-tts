@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"tts/internal/config"
 	"tts/internal/models"
@@ -44,12 +46,23 @@ type Client struct {
 	voicesCache       []models.Voice
 	voicesCacheMu     sync.RWMutex
 	voicesCacheExpiry time.Time
+	localeCache       map[string]cachedVoices
+
+	voicesCacheHit   uint64
+	voicesCacheMiss  uint64
+	localeCacheHit   uint64
+	localeCacheMiss  uint64
 
 	// 端点和认证信息
 	endpoint       map[string]interface{}
 	endpointMu     sync.RWMutex
 	endpointExpiry time.Time
 	ssmProcessor   *config.SSMLProcessor
+}
+
+type cachedVoices struct {
+	voices []models.Voice
+	expiry time.Time
 }
 
 // NewClient 创建一个新的Microsoft TTS客户端
@@ -59,6 +72,14 @@ func NewClient(cfg *config.Config) *Client {
 	if err != nil {
 		log.Fatalf("创建SSML处理器失败: %v", err)
 	}
+	transport := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	client := &Client{
 		defaultVoice:  cfg.TTS.DefaultVoice,
 		defaultRate:   cfg.TTS.DefaultRate,
@@ -66,9 +87,11 @@ func NewClient(cfg *config.Config) *Client {
 		defaultFormat: cfg.TTS.DefaultFormat,
 		maxTextLength: cfg.TTS.MaxTextLength,
 		httpClient: &http.Client{
-			Timeout: time.Duration(cfg.TTS.RequestTimeout) * time.Second,
+			Timeout:   time.Duration(cfg.TTS.RequestTimeout) * time.Second,
+			Transport: transport,
 		},
 		voicesCacheExpiry: time.Time{}, // 初始时缓存为空
+		localeCache:       make(map[string]cachedVoices),
 		endpointExpiry:    time.Time{}, // 初始时端点为空
 		ssmProcessor:      ssmProcessor,
 	}
@@ -92,7 +115,11 @@ func (c *Client) getEndpoint(ctx context.Context) (map[string]interface{}, error
 		log.Printf("获取认证信息失败: %v\n", err)
 		return nil, err
 	}
-	log.Printf("获取认证信息成功: %v\n", endpoint)
+	if region, ok := endpoint["r"]; ok {
+		log.Printf("获取认证信息成功，region: %v\n", region)
+	} else {
+		log.Printf("获取认证信息成功\n")
+	}
 
 	// 从 jwt 中解析出到期时间 exp
 	jwt := endpoint["t"].(string)
@@ -106,14 +133,34 @@ func (c *Client) getEndpoint(ctx context.Context) (map[string]interface{}, error
 	// 更新缓存
 	c.endpointMu.Lock()
 	c.endpoint = endpoint
-	c.endpointExpiry = expTime.Add(-1 * time.Minute) // 提前1分钟过期
+	c.endpointExpiry = expTime.Add(-5 * time.Minute) // 提前5分钟过期
 	c.endpointMu.Unlock()
 
 	return endpoint, nil
 }
 
+// invalidateEndpoint 清空端点缓存，触发下次请求刷新
+func (c *Client) invalidateEndpoint() {
+	c.endpointMu.Lock()
+	c.endpoint = nil
+	c.endpointExpiry = time.Time{}
+	c.endpointMu.Unlock()
+}
+
 // ListVoices 获取可用的语音列表
 func (c *Client) ListVoices(ctx context.Context, locale string) ([]models.Voice, error) {
+	// locale 级缓存命中（仅在有 locale 时）
+	if locale != "" {
+		c.voicesCacheMu.RLock()
+		if cached, ok := c.localeCache[locale]; ok && !cached.expiry.IsZero() && time.Now().Before(cached.expiry) && len(cached.voices) > 0 {
+			c.voicesCacheMu.RUnlock()
+			atomic.AddUint64(&c.localeCacheHit, 1)
+			return cached.voices, nil
+		}
+		c.voicesCacheMu.RUnlock()
+		atomic.AddUint64(&c.localeCacheMiss, 1)
+	}
+
 	// 检查缓存是否有效
 	c.voicesCacheMu.RLock()
 	if !c.voicesCacheExpiry.IsZero() && time.Now().Before(c.voicesCacheExpiry) && len(c.voicesCache) > 0 {
@@ -121,6 +168,7 @@ func (c *Client) ListVoices(ctx context.Context, locale string) ([]models.Voice,
 		log.Println("ListVoices 从缓存中获取语音列表: ", len(c.voicesCache), "个", "剩余时间:", c.voicesCacheExpiry.Sub(time.Now()))
 		voices := c.voicesCache
 		c.voicesCacheMu.RUnlock()
+		atomic.AddUint64(&c.voicesCacheHit, 1)
 
 		// 如果指定了locale，则过滤结果
 		if locale != "" {
@@ -131,11 +179,20 @@ func (c *Client) ListVoices(ctx context.Context, locale string) ([]models.Voice,
 					filtered = append(filtered, voice)
 				}
 			}
+
+			c.voicesCacheMu.Lock()
+			c.localeCache[locale] = cachedVoices{
+				voices: filtered,
+				expiry: c.voicesCacheExpiry,
+			}
+			c.voicesCacheMu.Unlock()
+
 			return filtered, nil
 		}
 		return voices, nil
 	}
 	c.voicesCacheMu.RUnlock()
+	atomic.AddUint64(&c.voicesCacheMiss, 1)
 
 	// 缓存无效，需要从API获取
 	log.Println("ListVoices, 缓存未命中，从API获取语音列表")
@@ -145,7 +202,9 @@ func (c *Client) ListVoices(ctx context.Context, locale string) ([]models.Voice,
 	}
 
 	url := fmt.Sprintf(voicesEndpoint, endpoint["r"])
-	log.Println("ListVoices, endpoint:", endpoint)
+	if region, ok := endpoint["r"]; ok {
+		log.Printf("ListVoices, region: %v\n", region)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -190,6 +249,7 @@ func (c *Client) ListVoices(ctx context.Context, locale string) ([]models.Voice,
 	c.voicesCacheMu.Lock()
 	c.voicesCache = voices
 	c.voicesCacheExpiry = time.Now().Add(8 * time.Hour) // 缓存 8 小时
+	c.localeCache = make(map[string]cachedVoices)       // 语音列表更新后清空 locale 缓存
 	c.voicesCacheMu.Unlock()
 
 	// 如果指定了locale，则过滤结果
@@ -201,6 +261,14 @@ func (c *Client) ListVoices(ctx context.Context, locale string) ([]models.Voice,
 				filtered = append(filtered, voice)
 			}
 		}
+
+		c.voicesCacheMu.Lock()
+		c.localeCache[locale] = cachedVoices{
+			voices: filtered,
+			expiry: c.voicesCacheExpiry,
+		}
+		c.voicesCacheMu.Unlock()
+
 		return filtered, nil
 	}
 
@@ -248,20 +316,33 @@ func (c *Client) SynthesizeSpeech(ctx context.Context, req models.TTSRequest) (*
 
 	return &models.TTSResponse{
 		AudioContent: audio,
-		ContentType:  "audio/mpeg",
+		ContentType:  contentTypeFromFormat(c.defaultFormat),
 		CacheHit:     false,
 	}, nil
 }
 
+func contentTypeFromFormat(format string) string {
+	if ct, ok := FormatContentTypeMap[format]; ok {
+		return ct
+	}
+	return "audio/mpeg"
+}
+
 // createTTSRequest 创建并执行TTS请求，返回HTTP响应
 func (c *Client) createTTSRequest(ctx context.Context, req models.TTSRequest) (*http.Response, error) {
+	return c.createTTSRequestWithRetry(ctx, req, false)
+}
+
+// createTTSRequestWithRetry 在认证失效时尝试刷新并重试一次
+func (c *Client) createTTSRequestWithRetry(ctx context.Context, req models.TTSRequest, retried bool) (*http.Response, error) {
 	// 参数验证
 	if req.Text == "" {
 		return nil, errors.New("文本不能为空")
 	}
 
-	if len(req.Text) > c.maxTextLength {
-		return nil, fmt.Errorf("文本长度超过限制 (%d > %d)", len(req.Text), c.maxTextLength)
+	textLen := utf8.RuneCountInString(req.Text)
+	if textLen > c.maxTextLength {
+		return nil, fmt.Errorf("文本长度超过限制 (%d > %d)", textLen, c.maxTextLength)
 	}
 
 	// 使用默认值填充空白参数
@@ -329,8 +410,20 @@ func (c *Client) createTTSRequest(ctx context.Context, req models.TTSRequest) (*
 		// 获取响应体以便调试
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		log.Printf("TTS API错误: %s, 状态码: %d", string(body), resp.StatusCode)
-		return nil, fmt.Errorf("TTS API错误: %s, 状态码: %d", string(body), resp.StatusCode)
+		requestID := resp.Header.Get("x-ms-request-id")
+		errText := string(body)
+		log.Printf("TTS API错误: %s, 状态码: %d, x-ms-request-id: %s", errText, resp.StatusCode, requestID)
+
+		if !retried && (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			log.Printf("TTS API返回 %d，刷新认证信息后重试一次", resp.StatusCode)
+			c.invalidateEndpoint()
+			return c.createTTSRequestWithRetry(ctx, req, true)
+		}
+
+		if requestID != "" {
+			return nil, fmt.Errorf("TTS API错误: %s, 状态码: %d, x-ms-request-id: %s", errText, resp.StatusCode, requestID)
+		}
+		return nil, fmt.Errorf("TTS API错误: %s, 状态码: %d", errText, resp.StatusCode)
 	}
 
 	return resp, nil

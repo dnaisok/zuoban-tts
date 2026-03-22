@@ -119,11 +119,27 @@ export interface FavoriteVoiceItem {
   gender: 'Male' | 'Female';
   styles?: string[]; // 支持的风格
   addedAt: Date; // 收藏时间
+  order?: number; // 排序顺序
 }
 
 // 收藏夹状态
 export interface FavoritesState {
   items: FavoriteVoiceItem[];
+  lastUpdated: Date | null;
+}
+
+// 文本模板项
+export interface TextTemplate {
+  id: string;
+  title: string;
+  content: string;
+  createdAt: Date;
+  order?: number;
+}
+
+// 文本模板状态
+export interface TemplatesState {
+  items: TextTemplate[];
   lastUpdated: Date | null;
 }
 
@@ -138,4 +154,15 @@ export const STORAGE_KEYS = {
   LOCALE: 'tts_locale',
   HISTORY: 'tts_history',
   FAVORITES: 'tts_favorites',
+
+  // 新的 Store 存储键
+  FORM_STORE: 'tts-form-store',
+  DATA_STORE: 'tts-data-store',
+  LANGUAGE_MAP: 'tts_language_map',
+  LANGUAGE_MAP_TIMESTAMP: 'tts_language_map_timestamp',
+  CURRENT_LANGUAGE: 'tts_current_language',
+  CURRENT_LOCALE: 'tts_current_locale',
+
+  // 文本模板
+  TEXT_TEMPLATES: 'tts_text_templates',
 } as const;
